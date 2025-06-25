@@ -53,3 +53,61 @@
     reward-pool: uint
   }
 )
+(define-map attention-records
+  { user: principal, content-id: uint }
+  {
+    attention-duration: uint,
+    interaction-type: (string-ascii 16),
+    timestamp: uint,
+    quality-rating: uint,
+    reward-earned: uint
+  }
+)
+
+(define-map campaigns
+  { campaign-id: uint }
+  {
+    creator: principal,
+    title: (string-ascii 64),
+    description: (string-ascii 256),
+    reward-pool: uint,
+    total-distributed: uint,
+    start-block: uint,
+    end-block: uint,
+    min-attention-duration: uint,
+    target-category: (string-ascii 32),
+    is-active: bool
+  }
+)
+
+(define-map validators
+  { validator: principal }
+  {
+    stake-amount: uint,
+    validation-count: uint,
+    accuracy-score: uint,
+    last-validation: uint,
+    is-active: bool
+  }
+)
+
+(define-map governance-proposals
+  { proposal-id: uint }
+  {
+    proposer: principal,
+    title: (string-ascii 64),
+    description: (string-ascii 256),
+    proposal-type: (string-ascii 32),
+    target-value: uint,
+    votes-for: uint,
+    votes-against: uint,
+    start-block: uint,
+    end-block: uint,
+    executed: bool
+  }
+)
+
+(define-map governance-votes
+  { proposal-id: uint, voter: principal }
+  { vote-power: uint, vote-choice: bool }
+)
