@@ -492,3 +492,8 @@
     governance-threshold: (var-get governance-threshold)
   }
 )
+
+;; Initialize contract
+(begin
+  (try! (ft-mint? attention-token u100000000 CONTRACT-OWNER)) ;; Initial mint for bootstrapping
+)
