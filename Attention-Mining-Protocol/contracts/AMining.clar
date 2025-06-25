@@ -111,3 +111,384 @@
   { proposal-id: uint, voter: principal }
   { vote-power: uint, vote-choice: bool }
 )
+
+
+;; Private Functions
+(define-private (calculate-attention-reward (duration uint) (quality uint) (multiplier uint))
+  (let
+    (
+      (base-calc (* (var-get base-reward) duration))
+      (quality-bonus (* base-calc quality))
+      (final-calc (/ quality-bonus u100))
+    )
+    (if (> multiplier u100)
+      (/ (* final-calc multiplier) u100)
+      final-calc
+    )
+  )
+)
+
+(define-private (update-reputation (user principal) (points uint))
+  (let
+    (
+      (current-profile (default-to 
+        { total-attention: u0, reputation-score: u0, last-activity: u0, total-earned: u0, is-validator: false }
+        (map-get? user-profiles { user: user })
+      ))
+    )
+    (map-set user-profiles
+      { user: user }
+      (merge current-profile { reputation-score: (+ (get reputation-score current-profile) points) })
+    )
+  )
+)
+
+(define-private (is-valid-validator (validator principal))
+  (match (map-get? validators { validator: validator })
+    validator-data (and (get is-active validator-data) (>= (get accuracy-score validator-data) u75))
+    false
+  )
+)
+
+;; Public Functions
+
+;; Token Management
+(define-public (mint-tokens (amount uint) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= (+ (ft-get-supply attention-token) amount) MAX-SUPPLY) ERR-INVALID-AMOUNT)
+    (ft-mint? attention-token amount recipient)
+  )
+)
+
+(define-public (transfer-tokens (amount uint) (recipient principal))
+  (begin
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (ft-transfer? attention-token amount tx-sender recipient)
+  )
+)
+
+;; User Profile Management
+(define-public (create-user-profile)
+  (let
+    (
+      (existing-profile (map-get? user-profiles { user: tx-sender }))
+    )
+    (asserts! (is-none existing-profile) ERR-ALREADY-EXISTS)
+    (ok (map-set user-profiles
+      { user: tx-sender }
+      {
+        total-attention: u0,
+        reputation-score: u100,
+        last-activity: block-height,
+        total-earned: u0,
+        is-validator: false
+      }
+    ))
+  )
+)
+
+(define-public (update-user-activity)
+  (let
+    (
+      (current-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR-NOT-FOUND))
+    )
+    (ok (map-set user-profiles
+      { user: tx-sender }
+      (merge current-profile { last-activity: block-height })
+    ))
+  )
+)
+
+;; Content Management
+(define-public (submit-content (content-hash (string-ascii 64)) (category (string-ascii 32)))
+  (let
+    (
+      (content-id (+ (var-get total-campaigns) u1))
+    )
+    (asserts! (> (len content-hash) u0) ERR-INVALID-AMOUNT)
+    (asserts! (> (len category) u0) ERR-INVALID-AMOUNT)
+    
+    (map-set content-items
+      { content-id: content-id }
+      {
+        creator: tx-sender,
+        content-hash: content-hash,
+        category: category,
+        total-attention: u0,
+        quality-score: u50,
+        timestamp: block-height,
+        is-validated: false,
+        reward-pool: u0
+      }
+    )
+    
+    (var-set total-campaigns content-id)
+    (try! (update-user-activity))
+    (ok content-id)
+  )
+)
+
+;; Attention Recording
+(define-public (record-attention (content-id uint) (duration uint) (interaction-type (string-ascii 16)))
+  (let
+    (
+      (content-data (unwrap! (map-get? content-items { content-id: content-id }) ERR-NOT-FOUND))
+      (user-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR-NOT-FOUND))
+      (quality-rating u75)
+      (reward-amount (calculate-attention-reward duration quality-rating (var-get quality-multiplier)))
+    )
+    
+    (asserts! (> duration u0) ERR-INVALID-DURATION)
+    (asserts! (>= duration u30) ERR-INVALID-DURATION) ;; Minimum 30 seconds
+    
+    ;; Record attention
+    (map-set attention-records
+      { user: tx-sender, content-id: content-id }
+      {
+        attention-duration: duration,
+        interaction-type: interaction-type,
+        timestamp: block-height,
+        quality-rating: quality-rating,
+        reward-earned: reward-amount
+      }
+    )
+    
+    ;; Update content stats
+    (map-set content-items
+      { content-id: content-id }
+      (merge content-data { 
+        total-attention: (+ (get total-attention content-data) duration)
+      })
+    )
+    
+    ;; Update user profile
+    (map-set user-profiles
+      { user: tx-sender }
+      (merge user-profile {
+        total-attention: (+ (get total-attention user-profile) duration),
+        total-earned: (+ (get total-earned user-profile) reward-amount),
+        last-activity: block-height
+      })
+    )
+    
+    ;; Mint reward tokens
+    (try! (as-contract (ft-mint? attention-token reward-amount tx-sender)))
+    (try! (update-reputation tx-sender (/ duration u60))) ;; 1 point per minute
+    
+    (ok reward-amount)
+  )
+)
+
+;; Validator System
+(define-public (become-validator (stake-amount uint))
+  (begin
+    (asserts! (>= stake-amount u10000) ERR-INVALID-AMOUNT) ;; Minimum stake
+    (asserts! (>= (ft-get-balance attention-token tx-sender) stake-amount) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (ft-transfer? attention-token stake-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set validators
+      { validator: tx-sender }
+      {
+        stake-amount: stake-amount,
+        validation-count: u0,
+        accuracy-score: u100,
+        last-validation: block-height,
+        is-active: true
+      }
+    )
+    
+    (let
+      (
+        (user-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR-NOT-FOUND))
+      )
+      (map-set user-profiles
+        { user: tx-sender }
+        (merge user-profile { is-validator: true })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (validate-content (content-id uint) (quality-score uint))
+  (let
+    (
+      (content-data (unwrap! (map-get? content-items { content-id: content-id }) ERR-NOT-FOUND))
+      (validator-data (unwrap! (map-get? validators { validator: tx-sender }) ERR-NOT-FOUND))
+    )
+    
+    (asserts! (is-valid-validator tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (<= quality-score u100) ERR-INVALID-AMOUNT)
+    (asserts! (not (get is-validated content-data)) ERR-ALREADY-EXISTS)
+    
+    ;; Update content validation
+    (map-set content-items
+      { content-id: content-id }
+      (merge content-data {
+        quality-score: quality-score,
+        is-validated: true
+      })
+    )
+    
+    ;; Update validator stats
+    (map-set validators
+      { validator: tx-sender }
+      (merge validator-data {
+        validation-count: (+ (get validation-count validator-data) u1),
+        last-validation: block-height
+      })
+    )
+    
+    ;; Reward validator
+    (try! (as-contract (ft-mint? attention-token u500 tx-sender)))
+    
+    (ok true)
+  )
+)
+
+;; Campaign Management
+(define-public (create-campaign 
+    (title (string-ascii 64))
+    (description (string-ascii 256))
+    (reward-pool uint)
+    (duration uint)
+    (min-attention uint)
+    (category (string-ascii 32))
+  )
+  (let
+    (
+      (campaign-id (+ (var-get total-campaigns) u1))
+    )
+    (asserts! (> reward-pool u0) ERR-INVALID-AMOUNT)
+    (asserts! (> duration u0) ERR-INVALID-DURATION)
+    (asserts! (>= (ft-get-balance attention-token tx-sender) reward-pool) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (ft-transfer? attention-token reward-pool tx-sender (as-contract tx-sender)))
+    
+    (map-set campaigns
+      { campaign-id: campaign-id }
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        reward-pool: reward-pool,
+        total-distributed: u0,
+        start-block: block-height,
+        end-block: (+ block-height duration),
+        min-attention-duration: min-attention,
+        target-category: category,
+        is-active: true
+      }
+    )
+    
+    (var-set total-campaigns campaign-id)
+    (ok campaign-id)
+  )
+)
+
+;; Governance
+(define-public (create-proposal 
+    (title (string-ascii 64))
+    (description (string-ascii 256))
+    (proposal-type (string-ascii 32))
+    (target-value uint)
+  )
+  (let
+    (
+      (proposal-id (+ (var-get total-campaigns) u1))
+      (user-balance (ft-get-balance attention-token tx-sender))
+    )
+    (asserts! (>= user-balance (var-get governance-threshold)) ERR-UNAUTHORIZED)
+    
+    (map-set governance-proposals
+      { proposal-id: proposal-id }
+      {
+        proposer: tx-sender,
+        title: title,
+        description: description,
+        proposal-type: proposal-type,
+        target-value: target-value,
+        votes-for: u0,
+        votes-against: u0,
+        start-block: block-height,
+        end-block: (+ block-height u1440), ;; ~10 days
+        executed: false
+      }
+    )
+    
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
+  (let
+    (
+      (proposal-data (unwrap! (map-get? governance-proposals { proposal-id: proposal-id }) ERR-NOT-FOUND))
+      (user-balance (ft-get-balance attention-token tx-sender))
+      (existing-vote (map-get? governance-votes { proposal-id: proposal-id, voter: tx-sender }))
+    )
+    (asserts! (> user-balance u0) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (< block-height (get end-block proposal-data)) ERR-CAMPAIGN-ENDED)
+    (asserts! (is-none existing-vote) ERR-ALREADY-EXISTS)
+    
+    (map-set governance-votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote-power: user-balance, vote-choice: vote-for }
+    )
+    
+    (map-set governance-proposals
+      { proposal-id: proposal-id }
+      (merge proposal-data
+        (if vote-for
+          { votes-for: (+ (get votes-for proposal-data) user-balance) }
+          { votes-against: (+ (get votes-against proposal-data) user-balance) }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Read-only Functions
+(define-read-only (get-token-balance (user principal))
+  (ft-get-balance attention-token user)
+)
+
+(define-read-only (get-user-profile (user principal))
+  (map-get? user-profiles { user: user })
+)
+
+(define-read-only (get-content-item (content-id uint))
+  (map-get? content-items { content-id: content-id })
+)
+
+(define-read-only (get-attention-record (user principal) (content-id uint))
+  (map-get? attention-records { user: user, content-id: content-id })
+)
+
+(define-read-only (get-campaign (campaign-id uint))
+  (map-get? campaigns { campaign-id: campaign-id })
+)
+
+(define-read-only (get-validator-info (validator principal))
+  (map-get? validators { validator: validator })
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? governance-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-contract-info)
+  {
+    total-supply: (ft-get-supply attention-token),
+    max-supply: MAX-SUPPLY,
+    total-campaigns: (var-get total-campaigns),
+    base-reward: (var-get base-reward),
+    governance-threshold: (var-get governance-threshold)
+  }
+)
